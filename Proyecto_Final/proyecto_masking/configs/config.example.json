@@ -7,7 +7,7 @@
     "user": "postgres",
     "password_env": "SRC_DB_PASS",
     "database": "app_prod"
-},
+  },
   "dest_db": {
     "dbms": "postgres",
     "host": "localhost",
@@ -15,7 +15,7 @@
     "user": "postgres",
     "password_env": "DST_DB_PASS",
     "database": "app_qa"
-},
+  },
   "tables": [
     {
       "name": "customers",
@@ -38,11 +38,11 @@
   ],
   "masking_rules": {
     "customers": {
-    "customer_id": "tokenize",
-    "email": "deterministic_hash",
-    "phone": "preserve_format",
-    "full_name": "redaction"
-},
+      "customer_id": "tokenize",
+      "email": "deterministic_hash",
+      "phone": "preserve_format",
+      "full_name": "redaction"
+    },
     "orders": {
       "customer_id": "tokenize",
       "card_number": "redaction"

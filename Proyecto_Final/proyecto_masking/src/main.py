@@ -15,14 +15,27 @@ from src.masking.mask_utils import (
     get_or_create_token
 )
 
+# ===========================================
+# CLAVES PRIMARIAS PARA UPSERT (IDEMPOTENCIA)
+# ===========================================
+UPSERT_KEYS = {
+    "customers": ["customer_id"],
+    "orders": ["order_id"],
+    "order_items": ["item_id"]
+}
+
 
 # ===========================================
-# ARCHIVO DE ESTADO (watermarks)
+# ARCHIVO DE ESTADO (watermarks) PARA DELTA
 # ===========================================
 STATE_FILE = "state/last_run.json"
 
 
 def load_state():
+    """
+    Cargar marcas de agua desde state/last_run.json.
+    Si no existe, regresamos {}.
+    """
     if not os.path.exists(STATE_FILE):
         return {}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -30,9 +43,26 @@ def load_state():
 
 
 def save_state(state):
+    """
+    Guardar marcas de agua por tabla en state/last_run.json.
+    """
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=4, default=str)
+
+
+# ===========================================
+# TRUNCATE EN QA (para modo FULL)
+# ===========================================
+def truncate_table_in_qa(conn, table_name: str):
+    """
+    Elimina todo el contenido de la tabla destino en QA.
+    Se usa en modo FULL.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(f"TRUNCATE TABLE {table_name};")
+    conn.commit()
+    print(f"  Tabla {table_name} truncada en QA")
 
 
 # ===========================================
@@ -61,7 +91,6 @@ def apply_masking(row: dict, rules: dict, conn_dest):
 # ===========================================
 # EXTRACT POR BATCHES
 # ===========================================
-
 @retry(
     wait=wait_fixed(1),
     stop=stop_after_attempt(3)
@@ -97,7 +126,9 @@ def extract_rows(cursor, table_name, batch_size=500, filter_clause=None):
 )
 def insert_rows(conn, table_name, rows: list):
     """
-    Inserta un batch. Reintenta automáticamente si falla.
+    Inserta un batch en QA.
+    - Si la tabla está en UPSERT_KEYS, usa ON CONFLICT (idempotencia).
+    - Si no, hace un INSERT normal.
     """
     if not rows:
         return
@@ -110,10 +141,24 @@ def insert_rows(conn, table_name, rows: list):
 
         values_list = [[row[col] for col in columns] for row in rows]
 
-        insert_query = f"INSERT INTO {table_name} ({col_str}) VALUES %s"
+        pk_cols = UPSERT_KEYS.get(table_name)
+
+        if pk_cols:
+            # Columnas de conflicto (PK)
+            conflict_cols = ", ".join(pk_cols)
+            # Columnas que se actualizarán (todas menos las PK)
+            update_cols = [c for c in columns if c not in pk_cols]
+            set_clause = ", ".join([f"{c} = EXCLUDED.{c}" for c in update_cols])
+
+            insert_query = (
+                f"INSERT INTO {table_name} ({col_str}) VALUES %s "
+                f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
+            )
+        else:
+            # Tabla sin configuración de UPSERT: INSERT normal
+            insert_query = f"INSERT INTO {table_name} ({col_str}) VALUES %s"
 
         execute_values(cursor, insert_query, values_list)
-
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -128,6 +173,13 @@ def insert_rows(conn, table_name, rows: list):
 def run_pipeline(config_path="configs/config.example.json"):
     cfg = load_config(config_path)
 
+    mode = cfg.get("mode", "delta")  # "full" o "delta"
+    dry_run = cfg.get("dry_run", False)
+
+    print(f"Entorno: {cfg.get('env_name', 'dev')}")
+    print(f"Modo de ejecución: {mode}")
+    print(f"Dry run: {dry_run}")
+
     # Conexiones
     conn_src = get_connection(cfg["source_db"])
     conn_dst = get_connection(cfg["dest_db"])
@@ -139,21 +191,36 @@ def run_pipeline(config_path="configs/config.example.json"):
         cursor_src = conn_src.cursor()
         print("=== EJECUTANDO PIPELINE ===")
 
-        # Cargar watermarks
-        state = load_state()
+        # Cargar watermarks solo si estamos en delta
+        state = load_state() if mode == "delta" else {}
 
         for table in cfg["tables"]:
             table_name = table["name"]
             batch_size = table.get("batch_size", 500)
+            watermark_column = table.get("watermark_column", "updated_at")
 
             print(f"\nProcesando tabla: {table_name}")
+            print(f"  Columna de marca de agua: {watermark_column}")
 
-            # Determinar filtro incremental (watermark)
-            last_wm = state.get(table_name)
-            if last_wm:
-                filter_clause = f"updated_at > '{last_wm}'"
-            else:
+            # ==========================
+            # FULL: truncar QA y leer TODO
+            # ==========================
+            if mode == "full":
+                truncate_table_in_qa(conn_dst, table_name)
+                # Usar filtro estático si viene definido en config, si no leer todo
                 filter_clause = table.get("filter")
+                last_wm = None  # no usamos marca de agua en full
+            else:
+                # ==========================
+                # DELTA: usar marca de agua previa (state)
+                # ==========================
+                last_wm = state.get(table_name)
+                if last_wm:
+                    filter_clause = f"{watermark_column} > '{last_wm}'"
+                    print(f"  Usando watermark previo: {watermark_column} > {last_wm}")
+                else:
+                    filter_clause = table.get("filter")
+                    print("  Sin watermark previo, se toma todo (o se aplica filter si existe)")
 
             total_rows_table = 0
 
@@ -165,21 +232,28 @@ def run_pipeline(config_path="configs/config.example.json"):
                     rules = cfg.get("masking_rules", {}).get(table_name, {})
                     masked_batch = [apply_masking(r, rules, conn_dst) for r in batch]
 
-                    insert_rows(conn_dst, table_name, masked_batch)
-                    print(f"  Batch insertado en {table_name}: {len(masked_batch)} filas")
+                    if not dry_run:
+                        insert_rows(conn_dst, table_name, masked_batch)
+                        print(f"  Batch insertado en {table_name}: {len(masked_batch)} filas")
+                    else:
+                        print(f"  (DRY RUN) Se habrían insertado {len(masked_batch)} filas en {table_name}")
 
                     # ⭐ REGISTRO DE AUDITORÍA (por batch)
                     auditor.log_table(table_name, len(masked_batch))
                     total_rows_table += len(masked_batch)
 
-                    # ⭐ ACTUALIZAR WATERMARK (usar el máximo updated_at del batch)
-                    # Asegurarse de que la columna exista y no sea None
-                    updated_vals = [row.get("updated_at") for row in batch if row.get("updated_at") is not None]
-                    if updated_vals:
-                        new_wm = max(updated_vals)
-                        # Guardar como cadena ISO para persistir en JSON
-                        state[table_name] = str(new_wm)
-                        save_state(state)
+                    # ⭐ ACTUALIZAR WATERMARK SOLO EN MODO DELTA
+                    if mode == "delta":
+                        updated_vals = [
+                            row.get(watermark_column)
+                            for row in batch
+                            if row.get(watermark_column) is not None
+                        ]
+                        if updated_vals:
+                            new_wm = max(updated_vals)
+                            state[table_name] = str(new_wm)
+                            save_state(state)
+
                 except Exception as batch_error:
                     print(f"  ❌ Error al procesar batch en {table_name}: {batch_error}")
                     auditor.log_error(table_name, str(batch_error))
@@ -197,7 +271,6 @@ def run_pipeline(config_path="configs/config.example.json"):
             auditor.log_error("general", str(e))
         except Exception:
             pass
-        # Re-lanzar o imprimir para visibilidad
         print("ERROR EN EL PIPELINE:", e)
 
     finally:
