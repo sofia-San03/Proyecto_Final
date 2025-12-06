@@ -4,11 +4,7 @@
     "dbms": "postgres",
     "host": "proyectofinal.cnm0m60kyrnp.us-east-2.rds.amazonaws.com",
     "port": 5432,
-<<<<<<< Updated upstream
-    "user": "app_prod_reader",
-=======
     "user": "Administrador",
->>>>>>> Stashed changes
     "password_env": "SRC_DB_PASS",
     "database": "app_prod"
   },
@@ -16,11 +12,7 @@
     "dbms": "postgres",
     "host": "proyectofinal.cnm0m60kyrnp.us-east-2.rds.amazonaws.com",
     "port": 5432,
-<<<<<<< Updated upstream
-    "user": "app_qa_loader",
-=======
     "user": "Administrador",
->>>>>>> Stashed changes
     "password_env": "DST_DB_PASS",
     "database": "app_qa"
   },
