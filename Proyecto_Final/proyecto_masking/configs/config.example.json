@@ -4,7 +4,7 @@
     "dbms": "postgres",
     "host": "localhost",
     "port": 5432,
-    "user": "postgres",
+    "user": "app_prod_reader",
     "password_env": "SRC_DB_PASS",
     "database": "app_prod"
   },
@@ -12,7 +12,7 @@
     "dbms": "postgres",
     "host": "localhost",
     "port": 5432,
-    "user": "postgres",
+    "user": "app_qa_loader",
     "password_env": "DST_DB_PASS",
     "database": "app_qa"
   },

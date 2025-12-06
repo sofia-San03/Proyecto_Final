@@ -40,6 +40,14 @@ class Auditor:
         Registrar fin de ejecución en execution_audit.
         """
         end_time = datetime.datetime.now()
+
+        # 👇 Limpiar cualquier transacción fallida previa
+        try:
+            self.conn.rollback()
+        except Exception:
+            # Si no hay transacción activa, no pasa nada
+            pass
+
         cursor = self.conn.cursor()
 
         query = """
