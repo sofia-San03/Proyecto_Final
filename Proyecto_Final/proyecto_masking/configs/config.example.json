@@ -1,18 +1,21 @@
 {
   "env_name": "dev_local",
+
+  "allowed_runner_roles": ["dba_admin", "postgres"],
+
   "source_db": {
     "dbms": "postgres",
-    "host": "proyectofinal.cnm0m60kyrnp.us-east-2.rds.amazonaws.com",
+    "host": "localhost",
     "port": 5432,
-    "user": "Administrador",
+    "user": "app_prod_reader",
     "password_env": "SRC_DB_PASS",
     "database": "app_prod"
   },
   "dest_db": {
     "dbms": "postgres",
-    "host": "proyectofinal.cnm0m60kyrnp.us-east-2.rds.amazonaws.com",
+    "host": "localhost",
     "port": 5432,
-    "user": "Administrador",
+    "user": "dba_admin",
     "password_env": "DST_DB_PASS",
     "database": "app_qa"
   },
@@ -55,5 +58,7 @@
     "backoff_seconds": 5
   },
   "mode": "delta",
-  "dry_run": false
+  "dry_run": false,
+  "parallel_tables": true,
+  "max_workers": 3
 }

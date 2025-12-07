@@ -4,6 +4,10 @@ import json
 import psycopg2
 from psycopg2.extras import execute_values
 from tenacity import retry, wait_exponential, wait_fixed, stop_after_attempt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+
 from src.config_loader import load_config
 from src.db.connection import get_connection
 from src.audit.auditor import Auditor
@@ -12,7 +16,7 @@ from src.masking.mask_utils import (
     deterministic_hash,
     redact,
     preserve_phone_format,
-    get_or_create_token
+    get_or_create_token,
 )
 
 # ===========================================
@@ -21,9 +25,8 @@ from src.masking.mask_utils import (
 UPSERT_KEYS = {
     "customers": ["customer_id"],
     "orders": ["order_id"],
-    "order_items": ["item_id"]
+    "order_items": ["item_id"],
 }
-
 
 # ===========================================
 # ARCHIVO DE ESTADO (watermarks) PARA DELTA
@@ -52,12 +55,12 @@ def save_state(state):
 
 
 # ===========================================
-# TRUNCATE EN QA (para modo FULL)
+# TRUNCATE EN QA (para modo FULL) - opcional
 # ===========================================
 def truncate_table_in_qa(conn, table_name: str):
     """
     Elimina todo el contenido de la tabla destino en QA.
-    Se usa en modo FULL.
+    Se usaría en modo FULL.
     """
     with conn.cursor() as cursor:
         cursor.execute(f"TRUNCATE TABLE {table_name};")
@@ -80,7 +83,9 @@ def apply_masking(row: dict, rules: dict, conn_dest):
             new_row[col] = preserve_phone_format(row.get(col))
         elif rule == "tokenize":
             value = row.get(col)
-            new_row[col] = get_or_create_token(conn_dest, str(value)) if value is not None else None
+            new_row[col] = (
+                get_or_create_token(conn_dest, str(value)) if value is not None else None
+            )
         else:
             # si no hay regla, conservar el valor original
             new_row[col] = row.get(col)
@@ -91,10 +96,7 @@ def apply_masking(row: dict, rules: dict, conn_dest):
 # ===========================================
 # EXTRACT POR BATCHES
 # ===========================================
-@retry(
-    wait=wait_fixed(1),
-    stop=stop_after_attempt(3)
-)
+@retry(wait=wait_fixed(1), stop=stop_after_attempt(3))
 def extract_rows(cursor, table_name, batch_size=500, filter_clause=None):
     offset = 0
     while True:
@@ -118,11 +120,11 @@ def extract_rows(cursor, table_name, batch_size=500, filter_clause=None):
 
 
 # ===========================================
-# INSERT POR BATCH (execute_values)
+# INSERT POR BATCH (execute_values) con UPSERT
 # ===========================================
 @retry(
     wait=wait_exponential(multiplier=1, min=1, max=5),
-    stop=stop_after_attempt(5)
+    stop=stop_after_attempt(5),
 )
 def insert_rows(conn, table_name, rows: list):
     """
@@ -168,100 +170,219 @@ def insert_rows(conn, table_name, rows: list):
 
 
 # ===========================================
-# PIPELINE PRINCIPAL
+# VALIDACIÓN DE ROL QUE EJECUTA EL PIPELINE
 # ===========================================
-def run_pipeline(config_path="configs/config.example.json"):
+def check_runner_role(conn, allowed_roles):
+    """
+    Verifica que el rol actual de la sesión de BD esté dentro de los
+    roles permitidos. Si no, lanza un PermissionError.
+    """
+    if not allowed_roles:
+        # Si la lista está vacía o no viene, no hacemos validación extra
+        return
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_user;")
+        current_role = cur.fetchone()[0]
+
+    if current_role not in allowed_roles:
+        raise PermissionError(
+            f"Rol de BD no autorizado para ejecutar el pipeline: '{current_role}'. "
+            f"Solo se permiten: {', '.join(allowed_roles)}."
+        )
+
+
+# ===========================================
+# PIPELINE PRINCIPAL (con paralelismo opcional)
+# ===========================================
+def run_pipeline(config_path="configs/config.example.json", mode_override=None):
     cfg = load_config(config_path)
 
-    mode = cfg.get("mode", "delta")  # "full" o "delta"
-    dry_run = cfg.get("dry_run", False)
+    # Pedir modo al usuario si no viene forzado
+    if mode_override is None:
+        mode_input = input(
+            "¿En qué modo quieres correr el pipeline? [delta/full] (default: delta): "
+        ).strip().lower()
+        mode = mode_input if mode_input in ("delta", "full") else "delta"
+    else:
+        mode = mode_override
 
-    print(f"Entorno: {cfg.get('env_name', 'dev')}")
+    dry_run = cfg.get("dry_run", False)
+    env_name = cfg.get("env_name", "dev_local")
+
+    print(f"Entorno: {env_name}")
     print(f"Modo de ejecución: {mode}")
     print(f"Dry run: {dry_run}")
 
-    # Conexiones
+    # 🔌 Conexiones base (solo para validar y para el auditor)
     conn_src = get_connection(cfg["source_db"])
     conn_dst = get_connection(cfg["dest_db"])
 
-    # Auditor (usa la conexión destino para persistir la auditoría)
-    auditor = Auditor(conn_dst, cfg.get("env_name", "dev"))
+    # 🔐 Validar rol que está corriendo el pipeline
+    allowed_roles = cfg.get("allowed_runner_roles", [])
+    try:
+        check_runner_role(conn_dst, allowed_roles)
+        print("Rol de BD autorizado, puedes ejecutar el pipeline.")
+    except PermissionError as e:
+        print("\n🚫 ERROR DE SEGURIDAD:", e)
+        # Cerramos conexiones y salimos SIN seguir con el pipeline
+        try:
+            conn_src.close()
+        except Exception:
+            pass
+        try:
+            conn_dst.close()
+        except Exception:
+            pass
+        return  # Salida temprana
+
+    # Si pasa la validación, ahora sí creamos el auditor
+    auditor = Auditor(conn_dst, env_name)
 
     try:
-        cursor_src = conn_src.cursor()
         print("=== EJECUTANDO PIPELINE ===")
 
-        # Cargar watermarks solo si estamos en delta
-        state = load_state() if mode == "delta" else {}
+        # Cargar watermarks y lock para acceso concurrente
+        state = load_state()
+        state_lock = threading.Lock()
 
-        for table in cfg["tables"]:
+        tables_cfg = cfg.get("tables", [])
+        parallel_tables = cfg.get("parallel_tables", False)
+        max_workers = cfg.get("max_workers", 3)
+
+        print(
+            f"Paralelismo por tabla: {parallel_tables} "
+            f"(workers = {max_workers})"
+        )
+
+        # -------------------------
+        # Función que procesa UNA tabla
+        # -------------------------
+        def process_table(table):
             table_name = table["name"]
             batch_size = table.get("batch_size", 500)
-            watermark_column = table.get("watermark_column", "updated_at")
 
             print(f"\nProcesando tabla: {table_name}")
-            print(f"  Columna de marca de agua: {watermark_column}")
+            print(f"  Tamaño de batch configurado: {batch_size}")
 
-            # ==========================
-            # FULL: truncar QA y leer TODO
-            # ==========================
-            if mode == "full":
-                truncate_table_in_qa(conn_dst, table_name)
-                # Usar filtro estático si viene definido en config, si no leer todo
-                filter_clause = table.get("filter")
-                last_wm = None  # no usamos marca de agua en full
-            else:
-                # ==========================
-                # DELTA: usar marca de agua previa (state)
-                # ==========================
-                last_wm = state.get(table_name)
-                if last_wm:
-                    filter_clause = f"{watermark_column} > '{last_wm}'"
-                    print(f"  Usando watermark previo: {watermark_column} > {last_wm}")
+            table_start = time.perf_counter()
+
+            # Conexiones LOCALES por thread
+            conn_src_local = get_connection(cfg["source_db"])
+            conn_dst_local = get_connection(cfg["dest_db"])
+            cursor_src_local = conn_src_local.cursor()
+
+            try:
+                # Leer watermark con lock
+                with state_lock:
+                    last_wm = state.get(table_name)
+
+                if last_wm and mode == "delta":
+                    filter_clause = f"updated_at > '{last_wm}'"
+                    print(f"  Usando watermark previo: updated_at > {last_wm}")
                 else:
                     filter_clause = table.get("filter")
-                    print("  Sin watermark previo, se toma todo (o se aplica filter si existe)")
+                    if mode == "delta" and not last_wm:
+                        print(
+                            "  No hay watermark previo, se toma todo "
+                            "(primera ejecución delta)."
+                        )
 
-            total_rows_table = 0
+                total_rows_table = 0
 
-            # Procesamiento por batches
-            for batch in extract_rows(cursor_src, table_name, batch_size, filter_clause):
-                print(f"  Batch extraído: {len(batch)} filas")
+                # Procesamiento por batches
+                for batch in extract_rows(
+                    cursor_src_local, table_name, batch_size, filter_clause
+                ):
+                    print(f"  Batch extraído: {len(batch)} filas")
 
-                try:
-                    rules = cfg.get("masking_rules", {}).get(table_name, {})
-                    masked_batch = [apply_masking(r, rules, conn_dst) for r in batch]
-
-                    if not dry_run:
-                        insert_rows(conn_dst, table_name, masked_batch)
-                        print(f"  Batch insertado en {table_name}: {len(masked_batch)} filas")
-                    else:
-                        print(f"  (DRY RUN) Se habrían insertado {len(masked_batch)} filas en {table_name}")
-
-                    # ⭐ REGISTRO DE AUDITORÍA (por batch)
-                    auditor.log_table(table_name, len(masked_batch))
-                    total_rows_table += len(masked_batch)
-
-                    # ⭐ ACTUALIZAR WATERMARK SOLO EN MODO DELTA
-                    if mode == "delta":
-                        updated_vals = [
-                            row.get(watermark_column)
-                            for row in batch
-                            if row.get(watermark_column) is not None
+                    try:
+                        rules = cfg.get("masking_rules", {}).get(table_name, {})
+                        masked_batch = [
+                            apply_masking(r, rules, conn_dst_local) for r in batch
                         ]
-                        if updated_vals:
-                            new_wm = max(updated_vals)
-                            state[table_name] = str(new_wm)
-                            save_state(state)
 
-                except Exception as batch_error:
-                    print(f"  ❌ Error al procesar batch en {table_name}: {batch_error}")
-                    auditor.log_error(table_name, str(batch_error))
-                    # Continuar con el siguiente batch en lugar de parar todo
-                    continue
+                        if dry_run:
+                            print(
+                                f"  (Dry run) NO se insertan filas en QA "
+                                f"({len(masked_batch)} filas)."
+                            )
+                        else:
+                            insert_rows(conn_dst_local, table_name, masked_batch)
+                            print(
+                                f"  Batch insertado en {table_name}: "
+                                f"{len(masked_batch)} filas"
+                            )
 
-            if total_rows_table == 0:
-                print(f"  No se procesaron filas para {table_name}")
+                        auditor.log_table(table_name, len(masked_batch))
+                        total_rows_table += len(masked_batch)
+
+                        # Actualizar watermark solo en modo delta
+                        if mode == "delta":
+                            updated_vals = [
+                                row.get("updated_at")
+                                for row in batch
+                                if row.get("updated_at") is not None
+                            ]
+                            if updated_vals:
+                                new_wm = max(updated_vals)
+                                with state_lock:
+                                    state[table_name] = str(new_wm)
+                                    save_state(state)
+
+                    except Exception as batch_error:
+                        print(
+                            f"  ❌ Error al procesar batch en {table_name}: "
+                            f"{batch_error}"
+                        )
+                        auditor.log_error(table_name, str(batch_error))
+                        continue
+
+                # Fin de la tabla: medimos tiempo
+                table_elapsed = time.perf_counter() - table_start
+                if total_rows_table == 0:
+                    print(f"  No se procesaron filas para {table_name}")
+                print(
+                    f"⏱  Tiempo total tabla {table_name}: "
+                    f"{table_elapsed:.3f} segundos"
+                )
+                print(
+                    f"   Filas totales procesadas en {table_name}: "
+                    f"{total_rows_table}"
+                )
+
+            finally:
+                # Cerrar recursos locales
+                try:
+                    cursor_src_local.close()
+                except Exception:
+                    pass
+                try:
+                    conn_src_local.close()
+                except Exception:
+                    pass
+                try:
+                    conn_dst_local.close()
+                except Exception:
+                    pass
+
+        # -------------------------
+        # Ejecutar tablas secuencial o en paralelo
+        # -------------------------
+        if parallel_tables and len(tables_cfg) > 1:
+            print("\n>>> Ejecutando tablas en paralelo...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(process_table, t) for t in tables_cfg]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        print("Error en thread de tabla:", e)
+                        auditor.log_error("thread", str(e))
+        else:
+            # Modo clásico secuencial
+            for table in tables_cfg:
+                process_table(table)
 
         print("\n=== PIPELINE COMPLETADO ===")
 
@@ -291,4 +412,26 @@ def run_pipeline(config_path="configs/config.example.json"):
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    # Leer config solo para saber el modo por defecto
+    cfg = load_config("configs/config.example.json")
+    default_mode = cfg.get("mode", "delta")
+
+    # Preguntar al usuario
+    resp = input(
+        f"¿En qué modo quieres correr el pipeline? "
+        f"[delta/full] (default: {default_mode}): "
+    ).strip().lower()
+
+    if resp == "":
+        chosen_mode = default_mode
+    elif resp in ("delta", "full"):
+        chosen_mode = resp
+    else:
+        print(
+            f"Modo '{resp}' no válido, usando modo por defecto "
+            f"'{default_mode}'."
+        )
+        chosen_mode = default_mode
+
+    # Ejecutar pipeline con el modo elegido
+    run_pipeline(mode_override=chosen_mode)
